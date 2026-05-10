@@ -13,12 +13,14 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "driver/gpio.h"
+#include "driver/rmt_tx.h"
+#include "driver/rmt_encoder.h"
 #include "esp_rom_sys.h"
 #include "lwip/sockets.h"
 #include "soc/gpio_reg.h"
 
 // ── WiFi credentials ──────────────────────────────
-#define WIFI_SSID       "Mostafa’s iPhone"
+#define WIFI_SSID       "Mostafa's iPhone"
 #define WIFI_PASS       "10001000"
 #define WIFI_MAX_RETRY  10
 
@@ -36,12 +38,18 @@
 #define TOPIC_ROOM      "smarthome/room001/room"
 #define TOPIC_COUNT     "smarthome/room001/count"
 #define TOPIC_COMMAND   "smarthome/room001/command"
+#define TOPIC_AC        "smarthome/room001/ac"        // NEW: AC status feedback
 
 // ── Pin definitions ───────────────────────────────
 #define DHT_PIN         GPIO_NUM_26
 #define PIR_PIN         GPIO_NUM_25
 #define IR_OUTER_PIN    GPIO_NUM_13   // outer receiver (outside the door)
 #define IR_INNER_PIN    GPIO_NUM_14   // inner receiver (inside the door)
+#define IR_TX_PIN       GPIO_NUM_18   // NEW: IR LED transmitter (AC control)
+
+// ── IR TX config ──────────────────────────────────
+#define IR_RESOLUTION_HZ  1000000    // 1 MHz → 1 µs per tick
+#define IR_CARRIER_HZ     38000      // 38 kHz carrier (standard for AC remotes)
 
 // ── Detection timing ──────────────────────────────
 #define POLL_PERIOD_MS      10
@@ -65,6 +73,11 @@ static SemaphoreHandle_t mqtt_tx_mutex = NULL;
 static volatile bool     mqtt_connected = false;
 static volatile bool     room_occupied  = false;
 
+// ── IR TX state ───────────────────────────────────
+static rmt_channel_handle_t ir_tx_channel  = NULL;
+static rmt_encoder_handle_t ir_copy_encoder = NULL;
+static volatile bool        ac_is_on       = false;
+
 // ── Directional detection state machine ───────────
 typedef enum {
     DETECT_IDLE,
@@ -81,6 +94,53 @@ static int            people_count      = 0;
 static bool outer_broken = false, inner_broken = false;
 static int  outer_hi = 0, outer_lo = 0;
 static int  inner_hi = 0, inner_lo = 0;
+
+// ─────────────────────────────────────────────────
+// AC IR raw codes (1 µs resolution, 38 kHz carrier)
+//
+// !! IMPORTANT !!
+// These are PLACEHOLDER timings based on a generic NEC-like protocol.
+// You MUST replace them with codes captured from your actual AC remote.
+// See ir_capture_task() at the bottom of this file for how to do that.
+//
+// Each rmt_symbol_word_t = one mark+space pair:
+//   .level0 = 1 (LED on),  .duration0 = mark  duration in µs
+//   .level1 = 0 (LED off), .duration1 = space duration in µs
+// ─────────────────────────────────────────────────
+
+// AC ON command — replace all entries below with your captured output
+static const rmt_symbol_word_t ac_on_cmd[] = {
+    // Header pulse
+    {.level0 = 1, .duration0 = 9000, .level1 = 0, .duration1 = 4500},
+    // Data bits (example pattern — replace with real bits)
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 1690},
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 560 },
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 1690},
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 560 },
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 1690},
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 1690},
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 560 },
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 560 },
+    // End stop bit
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 0   },
+};
+
+// AC OFF command — replace all entries below with your captured output
+static const rmt_symbol_word_t ac_off_cmd[] = {
+    // Header pulse
+    {.level0 = 1, .duration0 = 9000, .level1 = 0, .duration1 = 4500},
+    // Data bits (example pattern — replace with real bits)
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 560 },
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 1690},
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 560 },
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 1690},
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 560 },
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 560 },
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 1690},
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 1690},
+    // End stop bit
+    {.level0 = 1, .duration0 = 560,  .level1 = 0, .duration1 = 0   },
+};
 
 // ─────────────────────────────────────────────────
 // DHT22 bit-bang driver
@@ -138,6 +198,51 @@ done:
     DHT_OUTPUT(pin);
     DHT_HIGH(pin);
     return result;
+}
+
+// ─────────────────────────────────────────────────
+// IR TX (AC control via RMT peripheral)
+// ─────────────────────────────────────────────────
+static void ir_tx_init(void)
+{
+    rmt_tx_channel_config_t tx_cfg = {
+        .gpio_num          = IR_TX_PIN,
+        .clk_src           = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz     = IR_RESOLUTION_HZ,
+        .mem_block_symbols = 128,   // AC codes are long; 128 symbols to be safe
+        .trans_queue_depth = 4,
+        .flags.invert_out  = false,
+        .flags.with_dma    = false,
+    };
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_cfg, &ir_tx_channel));
+
+    // 38 kHz carrier, 33% duty cycle (standard for IR)
+    rmt_carrier_config_t carrier = {
+        .frequency_hz = IR_CARRIER_HZ,
+        .duty_cycle   = 0.33f,
+    };
+    ESP_ERROR_CHECK(rmt_apply_carrier(ir_tx_channel, &carrier));
+
+    rmt_copy_encoder_config_t enc_cfg = {};
+    ESP_ERROR_CHECK(rmt_new_copy_encoder(&enc_cfg, &ir_copy_encoder));
+
+    ESP_ERROR_CHECK(rmt_enable(ir_tx_channel));
+    ESP_LOGI(TAG, "IR TX armed on GPIO%d @ %d Hz carrier", IR_TX_PIN, IR_CARRIER_HZ);
+}
+
+static void ir_send(const rmt_symbol_word_t *symbols, size_t symbol_count)
+{
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0,  // send once
+    };
+    ESP_ERROR_CHECK(rmt_transmit(
+        ir_tx_channel,
+        ir_copy_encoder,
+        symbols,
+        symbol_count * sizeof(rmt_symbol_word_t),
+        &tx_config
+    ));
+    rmt_tx_wait_all_done(ir_tx_channel, pdMS_TO_TICKS(1000));
 }
 
 // ─────────────────────────────────────────────────
@@ -216,6 +321,13 @@ static void detection_poll(void)
                 if (people_count == 0 && room_occupied) {
                     room_occupied = false;
                     mqtt_pub(TOPIC_ROOM, "EMPTY");
+                    // Auto-turn off AC when last person leaves
+                    if (ac_is_on) {
+                        ESP_LOGI(TAG, "Room empty — auto AC OFF");
+                        ir_send(ac_off_cmd, sizeof(ac_off_cmd) / sizeof(ac_off_cmd[0]));
+                        ac_is_on = false;
+                        mqtt_pub(TOPIC_AC, "OFF");
+                    }
                 }
                 ESP_LOGI(TAG, "<<< EXIT (people in room: %d)", people_count);
                 last_detection_at = now;
@@ -458,15 +570,43 @@ static void mqtt_pub(const char *topic, const char *data)
     xSemaphoreGive(mqtt_tx_mutex);
 }
 
+// ─────────────────────────────────────────────────
+// Command handler
+// Supported MQTT commands on TOPIC_COMMAND:
+//   LIGHTS_ON  — placeholder for light control
+//   LIGHTS_OFF — placeholder for light control
+//   STATUS     — republish room occupancy
+//   AC_ON      — send IR power-on sequence to AC
+//   AC_OFF     — send IR power-off sequence to AC
+//   AC_STATUS  — republish current AC state
+// ─────────────────────────────────────────────────
 static void on_command(const char *cmd)
 {
     ESP_LOGI(TAG, "Command received: %s", cmd);
+
     if (strcmp(cmd, "LIGHTS_ON") == 0) {
         ESP_LOGI(TAG, ">>> Lights ON");
+
     } else if (strcmp(cmd, "LIGHTS_OFF") == 0) {
         ESP_LOGI(TAG, ">>> Lights OFF");
+
     } else if (strcmp(cmd, "STATUS") == 0) {
         mqtt_pub(TOPIC_ROOM, room_occupied ? "OCCUPIED" : "EMPTY");
+
+    } else if (strcmp(cmd, "AC_ON") == 0) {
+        ESP_LOGI(TAG, ">>> AC ON — sending IR");
+        ir_send(ac_on_cmd, sizeof(ac_on_cmd) / sizeof(ac_on_cmd[0]));
+        ac_is_on = true;
+        mqtt_pub(TOPIC_AC, "ON");
+
+    } else if (strcmp(cmd, "AC_OFF") == 0) {
+        ESP_LOGI(TAG, ">>> AC OFF — sending IR");
+        ir_send(ac_off_cmd, sizeof(ac_off_cmd) / sizeof(ac_off_cmd[0]));
+        ac_is_on = false;
+        mqtt_pub(TOPIC_AC, "OFF");
+
+    } else if (strcmp(cmd, "AC_STATUS") == 0) {
+        mqtt_pub(TOPIC_AC, ac_is_on ? "ON" : "OFF");
     }
 }
 
@@ -529,12 +669,86 @@ static bool mqtt_connect(void)
     ESP_LOGI(TAG, "MQTT connected.");
 
     xSemaphoreTake(mqtt_tx_mutex, portMAX_DELAY);
-    mqtt_send_subscribe_pkt(TOPIC_COMMAND);
+    mqtt_send_subscribe_pkt(TOPIC_COMMAND);   // room commands
+    mqtt_send_subscribe_pkt(TOPIC_AC);        // direct AC commands
     xSemaphoreGive(mqtt_tx_mutex);
-    ESP_LOGI(TAG, "Subscribed to: %s", TOPIC_COMMAND);
+    ESP_LOGI(TAG, "Subscribed to: %s, %s", TOPIC_COMMAND, TOPIC_AC);
 
     xTaskCreate(mqtt_recv_task, "mqtt_recv", 4096, NULL, 5, NULL);
     return true;
+}
+
+// ─────────────────────────────────────────────────
+// ONE-SHOT IR capture task
+//
+// HOW TO USE:
+//   1. Temporarily call:
+//        xTaskCreate(ir_capture_task, "ir_cap", 4096, NULL, 5, NULL);
+//      at the end of app_main() (after ir_tx_init()).
+//   2. Flash and open the serial monitor.
+//   3. Point your AC remote at IR_OUTER_PIN and press the ON button.
+//   4. Copy the printed symbol array from the log.
+//   5. Paste it into ac_on_cmd[] above.
+//   6. Repeat for the OFF button → ac_off_cmd[].
+//   7. Remove this task call before your final build.
+// ─────────────────────────────────────────────────
+static void ir_capture_task(void *arg)
+{
+    ESP_LOGI(TAG, "[CAPTURE] Point your remote at GPIO%d and press a button...", IR_OUTER_PIN);
+
+    rmt_channel_handle_t rx_ch = NULL;
+    rmt_rx_channel_config_t rx_cfg = {
+        .gpio_num          = IR_OUTER_PIN,
+        .clk_src           = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz     = IR_RESOLUTION_HZ,
+        .mem_block_symbols = 256,
+    };
+    if (rmt_new_rx_channel(&rx_cfg, &rx_ch) != ESP_OK) {
+        ESP_LOGE(TAG, "[CAPTURE] Failed to create RX channel");
+        vTaskDelete(NULL);
+        return;
+    }
+    rmt_enable(rx_ch);
+
+    rmt_symbol_word_t raw_symbols[256];
+    rmt_receive_config_t recv_cfg = {
+        .signal_range_min_ns =  1250,      // ignore glitches < 1.25 µs
+        .signal_range_max_ns = 12000000,   // stop after 12 ms silence
+    };
+
+    // Non-blocking receive — poll until data arrives (max 10 s)
+    rmt_receive(rx_ch, raw_symbols, sizeof(raw_symbols), &recv_cfg);
+
+    size_t received_symbols = 0;
+    for (int wait = 0; wait < 1000; wait++) {   // 10 s total
+        vTaskDelay(pdMS_TO_TICKS(10));
+        // Simple heuristic: a real frame ends with a symbol whose duration1 == 0
+        // Check if any symbols appeared (duration0 > 0 on first entry)
+        if (raw_symbols[0].duration0 > 0) {
+            // Count non-zero symbols
+            for (received_symbols = 0; received_symbols < 256; received_symbols++) {
+                if (raw_symbols[received_symbols].duration0 == 0 &&
+                    raw_symbols[received_symbols].duration1 == 0) break;
+            }
+            break;
+        }
+    }
+
+    if (received_symbols == 0) {
+        ESP_LOGW(TAG, "[CAPTURE] No signal received — check wiring / remote battery");
+    } else {
+        ESP_LOGI(TAG, "[CAPTURE] Got %d symbols. Copy into ac_on_cmd[] or ac_off_cmd[]:", (int)received_symbols);
+        printf("static const rmt_symbol_word_t ac_REPLACE_cmd[] = {\n");
+        for (size_t i = 0; i < received_symbols; i++) {
+            printf("    {.level0=1,.duration0=%-5u .level1=0,.duration1=%-5u},\n",
+                   raw_symbols[i].duration0, raw_symbols[i].duration1);
+        }
+        printf("};\n");
+    }
+
+    rmt_disable(rx_ch);
+    rmt_del_channel(rx_ch);
+    vTaskDelete(NULL);
 }
 
 // ─────────────────────────────────────────────────
@@ -566,21 +780,28 @@ void app_main(void)
     DHT_OUTPUT(DHT_PIN);
     DHT_HIGH(DHT_PIN);
 
-    // IR receivers
+    // IR receivers (door beams)
     ir_init();
     vTaskDelay(pdMS_TO_TICKS(200));
     ESP_LOGI(TAG, "IR beams armed — outer GPIO%d, inner GPIO%d",
              IR_OUTER_PIN, IR_INNER_PIN);
 
+    // IR transmitter (AC control)
+    ir_tx_init();
+
     ESP_LOGI(TAG, "=== Smart Home System ===");
     wifi_init();
     mqtt_connect();
+
+    // ── Uncomment the line below ONLY to capture your AC remote codes ──────
+    // xTaskCreate(ir_capture_task, "ir_cap", 4096, NULL, 5, NULL);
+    // ────────────────────────────────────────────────────────────────────────
 
     TickType_t last_dht_tick  = xTaskGetTickCount();
     TickType_t last_ping_tick = xTaskGetTickCount();
     TickType_t last_reconnect = xTaskGetTickCount() - pdMS_TO_TICKS(6000);
 
-    ESP_LOGI(TAG, "System ready.");
+    ESP_LOGI(TAG, "System ready. Send AC_ON or AC_OFF to %s", TOPIC_COMMAND);
 
     while (1) {
         TickType_t now = xTaskGetTickCount();
@@ -613,10 +834,10 @@ void app_main(void)
                 snprintf(hum_str,  sizeof(hum_str),  "%.1f", dht.humidity);
                 mqtt_pub(TOPIC_TEMP, temp_str);
                 mqtt_pub(TOPIC_HUM,  hum_str);
-                ESP_LOGI(TAG, "Temp: %s C | Hum: %s %% | Room: %s",
-                         temp_str, hum_str, room_occupied ? "OCCUPIED" : "EMPTY");
-            } else {
-                // ESP_LOGW(TAG, "DHT22 read failed.");
+                ESP_LOGI(TAG, "Temp: %s C | Hum: %s %% | Room: %s | AC: %s",
+                         temp_str, hum_str,
+                         room_occupied ? "OCCUPIED" : "EMPTY",
+                         ac_is_on      ? "ON"       : "OFF");
             }
         }
 
