@@ -19,17 +19,22 @@
 #include "soc/gpio_reg.h"
 
 // ── WiFi credentials ──────────────────────────────────────────────────────────
-#define WIFI_SSID       "Mostafa's iPhone"
-#define WIFI_PASS       "10001000"
+#define WIFI_SSID       "Redmi"
+#define WIFI_PASS       "12345678ok"
 #define WIFI_MAX_RETRY  10
 
 // ── Firebase configuration ────────────────────────────────────────────────────
 // Replace these with your actual Firebase project values.
-// FIREBASE_HOST  : your Realtime Database URL (no trailing slash, no https://)
-// FIREBASE_AUTH  : your database secret (or ID token for auth-protected DBs)
-#define FIREBASE_HOST   "your-project-default-rtdb.firebaseio.com"
-#define FIREBASE_AUTH   "your-database-secret-or-idtoken"
-#define FIREBASE_BASE   "/smarthome/room001"
+// FIREBASE_HOST    : your Realtime Database URL (no trailing slash, no https://)
+// FIREBASE_API_KEY : your Web API key (used for anonymous sign-in via Identity Toolkit)
+#define FIREBASE_HOST     "embeddedpro-573f6-default-rtdb.firebaseio.com"
+#define FIREBASE_API_KEY  "AIzaSyDDr6BjgGft1NnRrvOHGqe84ZWzmY_LiRI"
+#define FIREBASE_BASE     "/smarthome/room001"
+
+// ── Firebase anonymous-auth token state ──────────────────────────────────────
+static char fb_id_token[1200]         = {0};
+static TickType_t fb_token_obtained_at = 0;
+#define TOKEN_REFRESH_INTERVAL_MS  (55 * 60 * 1000)   // refresh every 55 min
 
 // ── Firebase paths ────────────────────────────────────────────────────────────
 #define PATH_TEMP       FIREBASE_BASE "/temperature.json"
@@ -197,8 +202,8 @@ static bool debounce_beam(int gpio, int *hi, int *lo, bool *broken)
 // Firebase HTTP helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Response buffer for GET requests
-static char http_response_buf[256];
+// Shared response buffer — sized for the largest response (anonymous sign-in ~2 KB)
+static char http_response_buf[2048];
 static int  http_response_len = 0;
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
@@ -216,6 +221,71 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
+static bool firebase_signin_anonymous(void)
+{
+    char url[128];
+    snprintf(url, sizeof(url),
+        "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=%s",
+        FIREBASE_API_KEY);
+
+    const char *body = "{\"returnSecureToken\":true}";
+
+    http_response_len = 0;
+    http_response_buf[0] = '\0';
+
+    esp_http_client_config_t cfg = {
+        .url           = url,
+        .method        = HTTP_METHOD_POST,
+        .cert_pem      = FIREBASE_ROOT_CA,
+        .event_handler = http_event_handler,
+        .timeout_ms    = 10000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "Accept-Encoding", "identity"); // force plain JSON, no gzip
+    esp_http_client_set_post_field(client, body, strlen(body));
+    esp_err_t err = esp_http_client_perform(client);
+    int status    = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status != 200) {
+        ESP_LOGE(TAG, "Anonymous sign-in failed: %s (HTTP %d) buf='%.80s'",
+                 esp_err_to_name(err), status, http_response_buf);
+        return false;
+    }
+
+    char *p = strstr(http_response_buf, "\"idToken\":");
+    if (!p) {
+        ESP_LOGE(TAG, "Sign-in: idToken field not found (len=%d buf='%.80s')",
+                 http_response_len, http_response_buf);
+        return false;
+    }
+    p += strlen("\"idToken\":");
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '"') {
+        ESP_LOGE(TAG, "Sign-in: unexpected char after idToken colon: 0x%02x", (unsigned char)*p);
+        return false;
+    }
+    p++; // skip opening quote
+    char *end = strchr(p, '"');
+    if (!end) {
+        ESP_LOGE(TAG, "Sign-in: idToken closing quote missing — response truncated?");
+        return false;
+    }
+    int len = end - p;
+    if (len >= (int)sizeof(fb_id_token)) {
+        ESP_LOGE(TAG, "Sign-in: idToken too long (%d bytes, max %d)", len, (int)sizeof(fb_id_token) - 1);
+        return false;
+    }
+    strncpy(fb_id_token, p, len);
+    fb_id_token[len] = '\0';
+
+    fb_token_obtained_at = xTaskGetTickCount();
+    ESP_LOGI(TAG, "Firebase: anonymous sign-in OK (token %d bytes).", len);
+    return true;
+}
+
 /**
  * firebase_put() — writes a JSON value to a Firebase path via HTTP PATCH.
  * Using PATCH on the specific leaf node (e.g. /temperature.json) is equivalent
@@ -226,8 +296,11 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
  */
 static void firebase_put(const char *path, const char *json)
 {
-    char url[256];
-    snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, FIREBASE_AUTH);
+    if ((xTaskGetTickCount() - fb_token_obtained_at) >= pdMS_TO_TICKS(TOKEN_REFRESH_INTERVAL_MS))
+        firebase_signin_anonymous();
+
+    static char url[1400];
+    snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, fb_id_token);
 
     esp_http_client_config_t cfg = {
         .url            = url,
@@ -235,6 +308,7 @@ static void firebase_put(const char *path, const char *json)
         .cert_pem       = FIREBASE_ROOT_CA,
         .event_handler  = http_event_handler,
         .timeout_ms     = 8000,
+        .buffer_size_tx = 1200,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -255,8 +329,11 @@ static void firebase_put(const char *path, const char *json)
  */
 static bool firebase_get(const char *path, char *out_buf, int out_size)
 {
-    char url[256];
-    snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, FIREBASE_AUTH);
+    if ((xTaskGetTickCount() - fb_token_obtained_at) >= pdMS_TO_TICKS(TOKEN_REFRESH_INTERVAL_MS))
+        firebase_signin_anonymous();
+
+    static char url[1400];
+    snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, fb_id_token);
 
     http_response_len = 0;
     http_response_buf[0] = '\0';
@@ -267,6 +344,7 @@ static bool firebase_get(const char *path, char *out_buf, int out_size)
         .cert_pem       = FIREBASE_ROOT_CA,
         .event_handler  = http_event_handler,
         .timeout_ms     = 8000,
+        .buffer_size_tx = 1200,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -289,14 +367,15 @@ static bool firebase_get(const char *path, char *out_buf, int out_size)
  */
 static void firebase_delete(const char *path)
 {
-    char url[256];
-    snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, FIREBASE_AUTH);
+    static char url[1400];
+    snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, fb_id_token);
 
     esp_http_client_config_t cfg = {
-        .url      = url,
-        .method   = HTTP_METHOD_DELETE,
-        .cert_pem = FIREBASE_ROOT_CA,
-        .timeout_ms = 8000,
+        .url            = url,
+        .method         = HTTP_METHOD_DELETE,
+        .cert_pem       = FIREBASE_ROOT_CA,
+        .timeout_ms     = 8000,
+        .buffer_size_tx = 1200,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -543,6 +622,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "=== Smart Home — Firebase REST ===");
     wifi_init();
+    firebase_signin_anonymous();
     ESP_LOGI(TAG, "System ready.");
 
     TickType_t last_dht_tick     = xTaskGetTickCount();
