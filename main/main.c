@@ -622,6 +622,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "=== Smart Home — Firebase REST ===");
     wifi_init();
+    esp_wifi_set_ps(WIFI_PS_NONE);   // disable radio sleep — prevents TLS timeout failures
     firebase_signin_anonymous();
     ESP_LOGI(TAG, "System ready.");
 
@@ -644,6 +645,8 @@ void app_main(void)
                 ESP_LOGI(TAG, "Temp: %.1f C | Hum: %.1f %% | Room: %s | Count: %d",
                          dht.temperature, dht.humidity,
                          room_occupied ? "OCCUPIED" : "EMPTY", people_count);
+            } else {
+                ESP_LOGW(TAG, "DHT22 read failed (check wiring on GPIO %d)", DHT_PIN);
             }
         }
 
