@@ -12,90 +12,113 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
+#include "esp_tls.h"
+#include "esp_http_client.h"
 #include "driver/gpio.h"
 #include "esp_rom_sys.h"
-#include "lwip/sockets.h"
 #include "soc/gpio_reg.h"
 
-// ── WiFi credentials ──────────────────────────────
-#define WIFI_SSID       "Mostafa’s iPhone"
+// ── WiFi credentials ──────────────────────────────────────────────────────────
+#define WIFI_SSID       "Mostafa's iPhone"
 #define WIFI_PASS       "10001000"
 #define WIFI_MAX_RETRY  10
 
-// ── MQTT broker ───────────────────────────────────
-#define MQTT_HOST       "172.20.10.2"
-#define MQTT_PORT       1883
-#define MQTT_USER       "admin"
-#define MQTT_PASS       "10001000"
-#define MQTT_CLIENT_ID  "ESP32-SmartHome"
-#define MQTT_KEEPALIVE  60
+// ── Firebase configuration ────────────────────────────────────────────────────
+// Replace these with your actual Firebase project values.
+// FIREBASE_HOST  : your Realtime Database URL (no trailing slash, no https://)
+// FIREBASE_AUTH  : your database secret (or ID token for auth-protected DBs)
+#define FIREBASE_HOST   "your-project-default-rtdb.firebaseio.com"
+#define FIREBASE_AUTH   "your-database-secret-or-idtoken"
+#define FIREBASE_BASE   "/smarthome/room001"
 
-// ── MQTT topics ───────────────────────────────────
-#define TOPIC_TEMP      "smarthome/room001/temperature"
-#define TOPIC_HUM       "smarthome/room001/humidity"
-#define TOPIC_ROOM      "smarthome/room001/room"
-#define TOPIC_COUNT     "smarthome/room001/count"
-#define TOPIC_COMMAND   "smarthome/room001/command"
+// ── Firebase paths ────────────────────────────────────────────────────────────
+#define PATH_TEMP       FIREBASE_BASE "/temperature.json"
+#define PATH_HUM        FIREBASE_BASE "/humidity.json"
+#define PATH_ROOM       FIREBASE_BASE "/room.json"
+#define PATH_COUNT      FIREBASE_BASE "/count.json"
+#define PATH_COMMAND    FIREBASE_BASE "/command.json"
 
-// ── Pin definitions ───────────────────────────────
+// ── Pin definitions ───────────────────────────────────────────────────────────
 #define DHT_PIN         GPIO_NUM_26
 #define PIR_PIN         GPIO_NUM_25
-#define IR_OUTER_PIN    GPIO_NUM_13   // outer receiver (outside the door)
-#define IR_INNER_PIN    GPIO_NUM_14   // inner receiver (inside the door)
-#define RELAY_PIN       GPIO_NUM_23   // relay IN1 — active LOW
+#define IR_OUTER_PIN    GPIO_NUM_13
+#define IR_INNER_PIN    GPIO_NUM_14
+#define RELAY_PIN       GPIO_NUM_23
 
-// ── Detection timing ──────────────────────────────
-#define POLL_PERIOD_MS      10
-#define DEBOUNCE_SAMPLES    5
-#define SEQUENCE_TIMEOUT_MS 3000
-#define COOLDOWN_MS         2000
+// ── Timing ────────────────────────────────────────────────────────────────────
+#define POLL_PERIOD_MS          10
+#define DEBOUNCE_SAMPLES        5
+#define SEQUENCE_TIMEOUT_MS     3000
+#define COOLDOWN_MS             2000
+#define DHT_INTERVAL_MS         5000
+#define COMMAND_POLL_MS         3000    // how often ESP32 checks Firebase for a new command
 
 static const char *TAG = "SmartHome";
 
-static void mqtt_pub(const char *topic, const char *data);
+// ── Firebase root CA (Google Trust Services) ──────────────────────────────────
+// This allows esp_http_client to verify the Firebase TLS certificate.
+// Update this cert if it expires (valid until ~2036).
+static const char FIREBASE_ROOT_CA[] =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIDdTCCAl2gAwIBAgILBAAAAAABFUtaw5QwDQYJKoZIhvcNAQEFBQAwVzELMAkG\n"
+    "A1UEBhMCQkUxGTAXBgNVBAoTEEdsb2JhbFNpZ24gbnYtc2ExEDAOBgNVBAsTB1Jv\n"
+    "b3QgQ0ExGzAZBgNVBAMTEkdsb2JhbFNpZ24gUm9vdCBDQTAeFw05ODA5MDExMjAw\n"
+    "MDBaFw0yODAxMjgxMjAwMDBaMFcxCzAJBgNVBAYTAkJFMRkwFwYDVQQKExBHbG9i\n"
+    "YWxTaWduIG52LXNhMRAwDgYDVQQLEwdSb290IENBMRswGQYDVQQDExJHbG9iYWxT\n"
+    "aWduIFJvb3QgQ0EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDaDuaZ\n"
+    "jc6j40+Kfvvxi4Mla+pIH/EqsLmVEQS98GPR4mdmzxzdzxtIK+6NiY6arymAZavp\n"
+    "xy0Sy6scTHAHoT0KMM0VjU/43dSMUBUc71DuxC73/OlS8pF94G3VNTCOXkNz8kHp\n"
+    "1Wrjsok6Vjk4bwY8iGlbKk3Fp1S4bInMm/k8yuX9ifUSPJJ4ltbcdG6TRGHRjcdG\n"
+    "snUOhugZitVtbNV4FpWi6cgKOOvyJBNPc1STE4U6G7weNLWLBYy5d4ux2x8gkasJ\n"
+    "U26Qzns3dLlwR5EiUWMWea6xrkEmCMgZK9FGqkjWZCrXgzT/LCrBbBlDSgeF59N8\n"
+    "9iFo7+ryUp9/k5DPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNVHRMBAf8E\n"
+    "BTADAQH/MB0GA1UdDgQWBBRge2YaRQ2XyolQL30EzTSo//z9SzANBgkqhkiG9w0B\n"
+    "AQUFAAOCAQEA1nPnfE920I2/7LqivjTFKDK1fPxsnCwrvQmeU79rXqoRSLblCKOz\n"
+    "yj1hTdNGCbM+w6DjY1Ub8rrvrTnhQ7k4o+YviiY776BQVvnGCv04zcQLcFGUl5gE\n"
+    "38NflNUVyRRBnMRddWQVDf9VMOyGj/8N7yy5Y0b2qvzfvGn9LhJIZJrglfCm7ymP\n"
+    "AbEVtQwdpf5pLGkkeB6zpxxxYu7KyJesF12KwvhHhm4qxFYxldBniYUr+WymXUad\n"
+    "DKqC5JlR3XC321Y9YeRq4VzW9v493kHMB65jUr9TU/Qr6cf9tveCX4XSQRjbgbME\n"
+    "HMUfpIBvFSDJ3gyICh3WZlXi/EjJKSZp4A==\n"
+    "-----END CERTIFICATE-----\n";
 
-static void relay_set(bool on)
-{
-    // Most relay modules are active LOW: LOW = relay energized = lamp ON
-    gpio_set_level(RELAY_PIN, on ? 1 : 0);
-    ESP_LOGI("relay", "Lamp %s", on ? "ON" : "OFF");
-}
-
-// ── WiFi ──────────────────────────────────────────
+// ── WiFi ──────────────────────────────────────────────────────────────────────
 static EventGroupHandle_t wifi_event_group;
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
+#define WIFI_CONNECTED_BIT  BIT0
+#define WIFI_FAIL_BIT       BIT1
 static int wifi_retry_count = 0;
 
-// ── MQTT state ────────────────────────────────────
-static int               mqtt_sock = -1;
-static SemaphoreHandle_t mqtt_tx_mutex = NULL;
-static volatile bool     mqtt_connected = false;
-static volatile bool     room_occupied  = false;
+// ── Global state ──────────────────────────────────────────────────────────────
+static volatile bool room_occupied = false;
+static int           people_count  = 0;
 
-// ── Directional detection state machine ───────────
+// ── Directional detection state machine ───────────────────────────────────────
 typedef enum {
     DETECT_IDLE,
-    DETECT_OUTER_FIRST,   // outer broke first → potential entrance
-    DETECT_INNER_FIRST,   // inner broke first → potential exit
-    DETECT_AWAIT_PIR,     // outer then inner broke → waiting for PIR to confirm entrance
+    DETECT_OUTER_FIRST,
+    DETECT_INNER_FIRST,
+    DETECT_AWAIT_PIR,
 } detect_state_t;
 
 static detect_state_t detect_state      = DETECT_IDLE;
 static TickType_t     state_entered_at  = 0;
 static TickType_t     last_detection_at = 0;
-static int            people_count      = 0;
 
 static bool outer_broken = false, inner_broken = false;
 static int  outer_hi = 0, outer_lo = 0;
 static int  inner_hi = 0, inner_lo = 0;
 
-// ─────────────────────────────────────────────────
-// DHT22 bit-bang driver
-// Uses direct register access (same as Arduino) to avoid ESP-IDF HAL overhead
-// that would break µs-level timing.  Pin must be 0-31.
-// Pull-up is configured once in app_main; direction is toggled here via OE bit.
-// ─────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Relay
+// ─────────────────────────────────────────────────────────────────────────────
+static void relay_set(bool on)
+{
+    gpio_set_level(RELAY_PIN, on ? 1 : 0);
+    ESP_LOGI("relay", "Lamp %s", on ? "ON" : "OFF");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DHT22 bit-bang driver (unchanged — timing-critical, no HAL)
+// ─────────────────────────────────────────────────────────────────────────────
 #define _DHT_BIT(p)   (1U << ((p) & 31U))
 #define DHT_READ(p)   (((REG_READ(GPIO_IN_REG))  >> (p)) & 1U)
 #define DHT_HIGH(p)   REG_WRITE(GPIO_OUT_W1TS_REG,  _DHT_BIT(p))
@@ -110,14 +133,11 @@ static dht_data_t dht_read(int pin)
     dht_data_t result = {0.0f, 0.0f, false};
     uint8_t data[5] = {0};
 
-    DHT_OUTPUT(pin);
-    DHT_LOW(pin);
+    DHT_OUTPUT(pin); DHT_LOW(pin);
     vTaskDelay(pdMS_TO_TICKS(20));
 
     portDISABLE_INTERRUPTS();
-    DHT_HIGH(pin);
-    esp_rom_delay_us(40);
-    DHT_INPUT(pin);
+    DHT_HIGH(pin); esp_rom_delay_us(40); DHT_INPUT(pin);
 
     int t = 0;
     while (DHT_READ(pin) == 1) { esp_rom_delay_us(1); if (++t > 200) goto done; }
@@ -143,14 +163,13 @@ static dht_data_t dht_read(int pin)
 
 done:
     portENABLE_INTERRUPTS();
-    DHT_OUTPUT(pin);
-    DHT_HIGH(pin);
+    DHT_OUTPUT(pin); DHT_HIGH(pin);
     return result;
 }
 
-// ─────────────────────────────────────────────────
-// IR receivers + directional detection
-// ─────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// IR receivers
+// ─────────────────────────────────────────────────────────────────────────────
 static void ir_init(void)
 {
     gpio_config_t io = {
@@ -163,24 +182,202 @@ static void ir_init(void)
     ESP_ERROR_CHECK(gpio_config(&io));
 }
 
-// Debounce one beam. Returns true on a LOW→HIGH (beam just broke) transition.
 static bool debounce_beam(int gpio, int *hi, int *lo, bool *broken)
 {
     int level = gpio_get_level(gpio);
     if (level) { (*hi)++; *lo = 0; }
     else        { (*lo)++; *hi = 0; }
-
     bool prev = *broken;
     if (!*broken && *hi >= DEBOUNCE_SAMPLES) *broken = true;
     if ( *broken && *lo >= DEBOUNCE_SAMPLES) *broken = false;
-    return (!prev && *broken);   // just broke
+    return (!prev && *broken);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Firebase HTTP helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Response buffer for GET requests
+static char http_response_buf[256];
+static int  http_response_len = 0;
+
+static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+{
+    if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        int copy = evt->data_len;
+        if (http_response_len + copy >= (int)sizeof(http_response_buf) - 1)
+            copy = sizeof(http_response_buf) - 1 - http_response_len;
+        if (copy > 0) {
+            memcpy(http_response_buf + http_response_len, evt->data, copy);
+            http_response_len += copy;
+            http_response_buf[http_response_len] = '\0';
+        }
+    }
+    return ESP_OK;
+}
+
+/**
+ * firebase_put() — writes a JSON value to a Firebase path via HTTP PATCH.
+ * Using PATCH on the specific leaf node (e.g. /temperature.json) is equivalent
+ * to a targeted PUT but avoids overwriting sibling nodes.
+ *
+ * @param path   e.g. "/smarthome/room001/temperature.json"
+ * @param json   e.g. "24.5"  or  "\"OCCUPIED\""
+ */
+static void firebase_put(const char *path, const char *json)
+{
+    char url[256];
+    snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, FIREBASE_AUTH);
+
+    esp_http_client_config_t cfg = {
+        .url            = url,
+        .method         = HTTP_METHOD_PUT,
+        .cert_pem       = FIREBASE_ROOT_CA,
+        .event_handler  = http_event_handler,
+        .timeout_ms     = 8000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, json, strlen(json));
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err != ESP_OK)
+        ESP_LOGW(TAG, "firebase_put(%s) failed: %s", path, esp_err_to_name(err));
+
+    esp_http_client_cleanup(client);
+}
+
+/**
+ * firebase_get() — reads a value from a Firebase path.
+ * Stores the raw JSON response in out_buf (null-terminated).
+ * Returns true on HTTP 200, false otherwise.
+ */
+static bool firebase_get(const char *path, char *out_buf, int out_size)
+{
+    char url[256];
+    snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, FIREBASE_AUTH);
+
+    http_response_len = 0;
+    http_response_buf[0] = '\0';
+
+    esp_http_client_config_t cfg = {
+        .url            = url,
+        .method         = HTTP_METHOD_GET,
+        .cert_pem       = FIREBASE_ROOT_CA,
+        .event_handler  = http_event_handler,
+        .timeout_ms     = 8000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_err_t err = esp_http_client_perform(client);
+    int status    = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status != 200) {
+        ESP_LOGW(TAG, "firebase_get(%s) failed (status %d)", path, status);
+        return false;
+    }
+
+    strncpy(out_buf, http_response_buf, out_size - 1);
+    out_buf[out_size - 1] = '\0';
+    return true;
+}
+
+/**
+ * firebase_delete() — sets a node to null (clears a command after processing).
+ */
+static void firebase_delete(const char *path)
+{
+    char url[256];
+    snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, FIREBASE_AUTH);
+
+    esp_http_client_config_t cfg = {
+        .url      = url,
+        .method   = HTTP_METHOD_DELETE,
+        .cert_pem = FIREBASE_ROOT_CA,
+        .timeout_ms = 8000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_perform(client);
+    esp_http_client_cleanup(client);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Firebase publish helpers (thin wrappers for clean call sites)
+// ─────────────────────────────────────────────────────────────────────────────
+static void pub_temperature(float t)
+{
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.1f", t);
+    firebase_put(PATH_TEMP, buf);
+}
+
+static void pub_humidity(float h)
+{
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.1f", h);
+    firebase_put(PATH_HUM, buf);
+}
+
+static void pub_room(const char *status)
+{
+    // Firebase string values must be quoted JSON strings
+    char buf[32];
+    snprintf(buf, sizeof(buf), "\"%s\"", status);
+    firebase_put(PATH_ROOM, buf);
+}
+
+static void pub_count(int count)
+{
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%d", count);
+    firebase_put(PATH_COUNT, buf);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Command polling — called from the main loop every COMMAND_POLL_MS
+// ─────────────────────────────────────────────────────────────────────────────
+static void poll_command(void)
+{
+    char raw[128];
+    if (!firebase_get(PATH_COMMAND, raw, sizeof(raw))) return;
+
+    // Firebase returns JSON: "LIGHTS_ON" (with quotes) or null
+    if (strcmp(raw, "null") == 0 || strlen(raw) < 3) return;
+
+    // Strip surrounding quotes: "LIGHTS_ON" → LIGHTS_ON
+    char cmd[64] = {0};
+    int len = strlen(raw);
+    if (raw[0] == '"' && raw[len - 1] == '"') {
+        strncpy(cmd, raw + 1, len - 2);
+        cmd[len - 2] = '\0';
+    } else {
+        strncpy(cmd, raw, sizeof(cmd) - 1);
+    }
+
+    ESP_LOGI(TAG, "Command received: %s", cmd);
+
+    if (strcmp(cmd, "LIGHTS_ON") == 0) {
+        relay_set(true);
+    } else if (strcmp(cmd, "LIGHTS_OFF") == 0) {
+        relay_set(false);
+    } else if (strcmp(cmd, "STATUS") == 0) {
+        pub_room(room_occupied ? "OCCUPIED" : "EMPTY");
+        pub_count(people_count);
+    }
+
+    // Clear the command node so it isn't processed again
+    firebase_delete(PATH_COMMAND);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Directional detection (unchanged logic — timing stays on-device)
+// ─────────────────────────────────────────────────────────────────────────────
 static void detection_poll(void)
 {
     TickType_t now = xTaskGetTickCount();
-
-    // Ignore everything during cooldown
     if ((now - last_detection_at) < pdMS_TO_TICKS(COOLDOWN_MS)) return;
 
     bool outer_just_broke = debounce_beam(IR_OUTER_PIN, &outer_hi, &outer_lo, &outer_broken);
@@ -202,31 +399,27 @@ static void detection_poll(void)
 
         case DETECT_OUTER_FIRST:
             if ((now - state_entered_at) >= pdMS_TO_TICKS(SEQUENCE_TIMEOUT_MS)) {
-                ESP_LOGI(TAG, "Sequence timeout — reset");
                 detect_state = DETECT_IDLE;
             } else if (inner_just_broke) {
                 detect_state = DETECT_AWAIT_PIR;
                 state_entered_at = now;
-                ESP_LOGI(TAG, "Both beams broke outer→inner — awaiting PIR");
+                ESP_LOGI(TAG, "outer→inner — awaiting PIR confirmation");
             }
             break;
 
         case DETECT_INNER_FIRST:
             if ((now - state_entered_at) >= pdMS_TO_TICKS(SEQUENCE_TIMEOUT_MS)) {
-                ESP_LOGI(TAG, "Sequence timeout — reset");
                 detect_state = DETECT_IDLE;
             } else if (outer_just_broke) {
-                // EXIT: inner then outer — no PIR needed
+                // EXIT confirmed
                 people_count = (people_count > 0) ? people_count - 1 : 0;
-                char cnt[12];
-                snprintf(cnt, sizeof(cnt), "%d", people_count);
-                mqtt_pub(TOPIC_COUNT, cnt);
+                pub_count(people_count);
                 if (people_count == 0 && room_occupied) {
                     room_occupied = false;
-                    mqtt_pub(TOPIC_ROOM, "EMPTY");
+                    pub_room("EMPTY");
                     relay_set(false);
                 }
-                ESP_LOGI(TAG, "<<< EXIT (people in room: %d)", people_count);
+                ESP_LOGI(TAG, "<<< EXIT (people: %d)", people_count);
                 last_detection_at = now;
                 detect_state = DETECT_IDLE;
             }
@@ -234,20 +427,18 @@ static void detection_poll(void)
 
         case DETECT_AWAIT_PIR:
             if ((now - state_entered_at) >= pdMS_TO_TICKS(SEQUENCE_TIMEOUT_MS)) {
-                ESP_LOGI(TAG, "PIR timeout — entrance not confirmed, reset");
+                ESP_LOGI(TAG, "PIR timeout — entrance not confirmed");
                 detect_state = DETECT_IDLE;
             } else if (gpio_get_level(PIR_PIN) == 1) {
-                // ENTRANCE: outer→inner + PIR confirmed
+                // ENTRANCE confirmed
                 people_count++;
-                char cnt[12];
-                snprintf(cnt, sizeof(cnt), "%d", people_count);
-                mqtt_pub(TOPIC_COUNT, cnt);
+                pub_count(people_count);
                 if (!room_occupied) {
                     room_occupied = true;
-                    mqtt_pub(TOPIC_ROOM, "OCCUPIED");
+                    pub_room("OCCUPIED");
                     relay_set(true);
                 }
-                ESP_LOGI(TAG, ">>> ENTRANCE confirmed (people in room: %d)", people_count);
+                ESP_LOGI(TAG, ">>> ENTRANCE confirmed (people: %d)", people_count);
                 last_detection_at = now;
                 detect_state = DETECT_IDLE;
             }
@@ -255,16 +446,15 @@ static void detection_poll(void)
     }
 }
 
-// ─────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // WiFi
-// ─────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *event_data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        mqtt_connected = false;
         if (wifi_retry_count < WIFI_MAX_RETRY) {
             esp_wifi_connect();
             wifi_retry_count++;
@@ -280,29 +470,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     }
 }
 
-static void wifi_scan_and_log(void)
-{
-    wifi_scan_config_t scan_cfg = { .show_hidden = false };
-    esp_wifi_scan_start(&scan_cfg, true);
-
-    uint16_t count = 0;
-    esp_wifi_scan_get_ap_num(&count);
-    if (count == 0) {
-        ESP_LOGI(TAG, "WiFi scan: no networks found");
-        return;
-    }
-
-    wifi_ap_record_t *records = malloc(count * sizeof(wifi_ap_record_t));
-    if (!records) return;
-
-    esp_wifi_scan_get_ap_records(&count, records);
-    ESP_LOGI(TAG, "WiFi scan: %d network(s) found:", count);
-    for (int i = 0; i < count; i++) {
-        ESP_LOGI(TAG, "  [%2d] RSSI %4d  %s", i + 1, records[i].rssi, records[i].ssid);
-    }
-    free(records);
-}
-
 static void wifi_init(void)
 {
     wifi_event_group = xEventGroupCreate();
@@ -313,10 +480,6 @@ static void wifi_init(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    wifi_scan_and_log();
-
     esp_event_handler_instance_t h_any, h_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                                         wifi_event_handler, NULL, &h_any));
@@ -324,234 +487,21 @@ static void wifi_init(void)
                                                         wifi_event_handler, NULL, &h_ip));
 
     wifi_config_t wifi_cfg = { .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS } };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
-    ESP_ERROR_CHECK(esp_wifi_disconnect());
-    ESP_ERROR_CHECK(esp_wifi_connect());
-    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    xEventGroupWaitBits(wifi_event_group,
+                        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                         pdFALSE, pdFALSE, portMAX_DELAY);
 }
 
-// ─────────────────────────────────────────────────
-// Minimal MQTT 3.1.1 over TCP socket
-// ─────────────────────────────────────────────────
-static int mqtt_encode_len(uint8_t *buf, int len)
-{
-    int n = 0;
-    do {
-        uint8_t b = len & 0x7F;
-        len >>= 7;
-        if (len) b |= 0x80;
-        buf[n++] = b;
-    } while (len);
-    return n;
-}
-
-static int sock_write_all(const uint8_t *data, int len)
-{
-    int sent = 0;
-    while (sent < len) {
-        int n = send(mqtt_sock, data + sent, len - sent, 0);
-        if (n <= 0) return -1;
-        sent += n;
-    }
-    return sent;
-}
-
-static int sock_read_all(uint8_t *buf, int len)
-{
-    int got = 0;
-    while (got < len) {
-        int n = recv(mqtt_sock, buf + got, len - got, 0);
-        if (n <= 0) return -1;
-        got += n;
-    }
-    return got;
-}
-
-static int mqtt_recv_packet(uint8_t *buf, int buf_size, int *out_len)
-{
-    uint8_t hdr;
-    if (sock_read_all(&hdr, 1) < 0) return -1;
-
-    int remaining = 0, shift = 0;
-    uint8_t b;
-    do {
-        if (sock_read_all(&b, 1) < 0) return -1;
-        remaining |= (b & 0x7F) << shift;
-        shift += 7;
-    } while (b & 0x80);
-
-    *out_len = remaining;
-    if (remaining > 0) {
-        if (remaining > buf_size) {
-            uint8_t trash[64];
-            int left = remaining;
-            while (left > 0) {
-                int chunk = left < 64 ? left : 64;
-                if (sock_read_all(trash, chunk) < 0) return -1;
-                left -= chunk;
-            }
-        } else {
-            if (sock_read_all(buf, remaining) < 0) return -1;
-        }
-    }
-    return hdr & 0xF0;
-}
-
-static bool mqtt_send_connect_pkt(void)
-{
-    uint8_t pl[200];
-    int plen = 0;
-
-    pl[plen++] = 0x00; pl[plen++] = 0x04;
-    pl[plen++] = 'M'; pl[plen++] = 'Q'; pl[plen++] = 'T'; pl[plen++] = 'T';
-    pl[plen++] = 0x04;
-    pl[plen++] = 0xC2;
-    pl[plen++] = (MQTT_KEEPALIVE >> 8) & 0xFF;
-    pl[plen++] = MQTT_KEEPALIVE & 0xFF;
-
-    uint16_t id_len = strlen(MQTT_CLIENT_ID);
-    pl[plen++] = id_len >> 8; pl[plen++] = id_len & 0xFF;
-    memcpy(pl + plen, MQTT_CLIENT_ID, id_len); plen += id_len;
-
-    uint16_t u_len = strlen(MQTT_USER);
-    pl[plen++] = u_len >> 8; pl[plen++] = u_len & 0xFF;
-    memcpy(pl + plen, MQTT_USER, u_len); plen += u_len;
-
-    uint16_t pw_len = strlen(MQTT_PASS);
-    pl[plen++] = pw_len >> 8; pl[plen++] = pw_len & 0xFF;
-    memcpy(pl + plen, MQTT_PASS, pw_len); plen += pw_len;
-
-    uint8_t pkt[210];
-    int pos = 0;
-    pkt[pos++] = 0x10;
-    pos += mqtt_encode_len(pkt + pos, plen);
-    memcpy(pkt + pos, pl, plen); pos += plen;
-    return sock_write_all(pkt, pos) == pos;
-}
-
-static bool mqtt_send_subscribe_pkt(const char *topic)
-{
-    int tlen = strlen(topic);
-    uint8_t pkt[128];
-    int pos = 0;
-    pkt[pos++] = 0x82;
-    pos += mqtt_encode_len(pkt + pos, 2 + 2 + tlen + 1);
-    pkt[pos++] = 0x00; pkt[pos++] = 0x01;
-    pkt[pos++] = tlen >> 8; pkt[pos++] = tlen & 0xFF;
-    memcpy(pkt + pos, topic, tlen); pos += tlen;
-    pkt[pos++] = 0x00;
-    return sock_write_all(pkt, pos) == pos;
-}
-
-static void mqtt_send_pingreq(void)
-{
-    uint8_t pkt[] = {0xC0, 0x00};
-    sock_write_all(pkt, 2);
-}
-
-static void mqtt_pub(const char *topic, const char *data)
-{
-    if (!mqtt_connected) return;
-    int tlen = strlen(topic);
-    int dlen = strlen(data);
-    uint8_t pkt[256];
-    int pos = 0;
-    pkt[pos++] = 0x30;
-    pos += mqtt_encode_len(pkt + pos, 2 + tlen + dlen);
-    pkt[pos++] = tlen >> 8; pkt[pos++] = tlen & 0xFF;
-    memcpy(pkt + pos, topic, tlen); pos += tlen;
-    memcpy(pkt + pos, data,  dlen); pos += dlen;
-
-    xSemaphoreTake(mqtt_tx_mutex, portMAX_DELAY);
-    sock_write_all(pkt, pos);
-    xSemaphoreGive(mqtt_tx_mutex);
-}
-
-static void on_command(const char *cmd)
-{
-    ESP_LOGI(TAG, "Command received: %s", cmd);
-    if (strcmp(cmd, "LIGHTS_ON") == 0) {
-        relay_set(true);
-    } else if (strcmp(cmd, "LIGHTS_OFF") == 0) {
-        relay_set(false);
-    } else if (strcmp(cmd, "STATUS") == 0) {
-        mqtt_pub(TOPIC_ROOM, room_occupied ? "OCCUPIED" : "EMPTY");
-    }
-}
-
-static void mqtt_recv_task(void *arg)
-{
-    uint8_t buf[256];
-    int pkt_len;
-
-    while (1) {
-        int type = mqtt_recv_packet(buf, sizeof(buf), &pkt_len);
-        if (type < 0) {
-            ESP_LOGW(TAG, "MQTT recv error — will reconnect");
-            break;
-        }
-        if (type == 0x30 && pkt_len >= 2) {
-            int tlen = (buf[0] << 8) | buf[1];
-            int dlen = pkt_len - 2 - tlen;
-            if (dlen > 0 && (2 + tlen + dlen) <= pkt_len) {
-                char cmd[128] = {0};
-                int copy = dlen < (int)(sizeof(cmd) - 1) ? dlen : (int)(sizeof(cmd) - 1);
-                memcpy(cmd, buf + 2 + tlen, copy);
-                on_command(cmd);
-            }
-        }
-    }
-
-    mqtt_connected = false;
-    close(mqtt_sock);
-    mqtt_sock = -1;
-    vTaskDelete(NULL);
-}
-
-static bool mqtt_connect(void)
-{
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port   = htons(MQTT_PORT),
-    };
-    inet_aton(MQTT_HOST, &addr.sin_addr);
-
-    mqtt_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (mqtt_sock < 0) { ESP_LOGE(TAG, "socket() failed"); return false; }
-
-    if (connect(mqtt_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        ESP_LOGE(TAG, "TCP connect failed");
-        close(mqtt_sock); mqtt_sock = -1; return false;
-    }
-
-    if (!mqtt_send_connect_pkt()) {
-        close(mqtt_sock); mqtt_sock = -1; return false;
-    }
-
-    uint8_t ack[4] = {0};
-    if (sock_read_all(ack, 4) < 0 || ack[0] != 0x20 || ack[3] != 0x00) {
-        ESP_LOGE(TAG, "CONNACK failed (rc=0x%02x)", ack[3]);
-        close(mqtt_sock); mqtt_sock = -1; return false;
-    }
-
-    mqtt_connected = true;
-    ESP_LOGI(TAG, "MQTT connected.");
-
-    xSemaphoreTake(mqtt_tx_mutex, portMAX_DELAY);
-    mqtt_send_subscribe_pkt(TOPIC_COMMAND);
-    xSemaphoreGive(mqtt_tx_mutex);
-    ESP_LOGI(TAG, "Subscribed to: %s", TOPIC_COMMAND);
-
-    xTaskCreate(mqtt_recv_task, "mqtt_recv", 4096, NULL, 5, NULL);
-    return true;
-}
-
-// ─────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Entry point
-// ─────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 void app_main(void)
 {
+    // NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -559,9 +509,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    mqtt_tx_mutex = xSemaphoreCreateMutex();
-
-    // Relay — start with lamp OFF (HIGH = relay off for active-LOW module)
+    // Relay — lamp OFF at boot
     gpio_config_t relay_cfg = {
         .pin_bit_mask = (1ULL << RELAY_PIN),
         .mode         = GPIO_MODE_OUTPUT,
@@ -570,8 +518,8 @@ void app_main(void)
         .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&relay_cfg);
-    relay_set(true);
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    relay_set(true);                        // self-test flash
+    vTaskDelay(pdMS_TO_TICKS(500));
     relay_set(false);
 
     // PIR
@@ -589,58 +537,40 @@ void app_main(void)
     DHT_OUTPUT(DHT_PIN);
     DHT_HIGH(DHT_PIN);
 
-    // IR receivers
+    // IR
     ir_init();
     vTaskDelay(pdMS_TO_TICKS(200));
-    ESP_LOGI(TAG, "IR beams armed — outer GPIO%d, inner GPIO%d",
-             IR_OUTER_PIN, IR_INNER_PIN);
 
-    ESP_LOGI(TAG, "=== Smart Home System ===");
+    ESP_LOGI(TAG, "=== Smart Home — Firebase REST ===");
     wifi_init();
-    mqtt_connect();
-
-    TickType_t last_dht_tick  = xTaskGetTickCount();
-    TickType_t last_ping_tick = xTaskGetTickCount();
-    TickType_t last_reconnect = xTaskGetTickCount() - pdMS_TO_TICKS(6000);
-
     ESP_LOGI(TAG, "System ready.");
+
+    TickType_t last_dht_tick     = xTaskGetTickCount();
+    TickType_t last_command_tick = xTaskGetTickCount();
 
     while (1) {
         TickType_t now = xTaskGetTickCount();
 
-        // ── Reconnect if dropped ─────────────────────────────────────────────
-        if (!mqtt_connected && (now - last_reconnect) >= pdMS_TO_TICKS(5000)) {
-            last_reconnect = now;
-            ESP_LOGI(TAG, "Reconnecting MQTT...");
-            mqtt_connect();
-        }
-
-        // ── Keepalive ping ───────────────────────────────────────────────────
-        if (mqtt_connected && (now - last_ping_tick) >= pdMS_TO_TICKS(30000)) {
-            last_ping_tick = now;
-            xSemaphoreTake(mqtt_tx_mutex, portMAX_DELAY);
-            mqtt_send_pingreq();
-            xSemaphoreGive(mqtt_tx_mutex);
-        }
-
-        // ── Directional detection (IR beams + PIR) ──────────────────────────
+        // ── Directional detection (IR + PIR) — every POLL_PERIOD_MS ──────────
         detection_poll();
 
-        // ── DHT22 every 5 s ──────────────────────────────────────────────────
-        if ((now - last_dht_tick) >= pdMS_TO_TICKS(5000)) {
+        // ── DHT22 — every DHT_INTERVAL_MS ─────────────────────────────────────
+        if ((now - last_dht_tick) >= pdMS_TO_TICKS(DHT_INTERVAL_MS)) {
             last_dht_tick = now;
             dht_data_t dht = dht_read(DHT_PIN);
             if (dht.valid) {
-                char temp_str[10], hum_str[10];
-                snprintf(temp_str, sizeof(temp_str), "%.1f", dht.temperature);
-                snprintf(hum_str,  sizeof(hum_str),  "%.1f", dht.humidity);
-                mqtt_pub(TOPIC_TEMP, temp_str);
-                mqtt_pub(TOPIC_HUM,  hum_str);
-                ESP_LOGI(TAG, "Temp: %s C | Hum: %s %% | Room: %s",
-                         temp_str, hum_str, room_occupied ? "OCCUPIED" : "EMPTY");
-            } else {
-                // ESP_LOGW(TAG, "DHT22 read failed.");
+                pub_temperature(dht.temperature);
+                pub_humidity(dht.humidity);
+                ESP_LOGI(TAG, "Temp: %.1f C | Hum: %.1f %% | Room: %s | Count: %d",
+                         dht.temperature, dht.humidity,
+                         room_occupied ? "OCCUPIED" : "EMPTY", people_count);
             }
+        }
+
+        // ── Command polling — every COMMAND_POLL_MS ───────────────────────────
+        if ((now - last_command_tick) >= pdMS_TO_TICKS(COMMAND_POLL_MS)) {
+            last_command_tick = now;
+            poll_command();
         }
 
         vTaskDelay(pdMS_TO_TICKS(POLL_PERIOD_MS));
