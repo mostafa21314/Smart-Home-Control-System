@@ -42,6 +42,7 @@
 #define PIR_PIN         GPIO_NUM_25
 #define IR_OUTER_PIN    GPIO_NUM_13   // outer receiver (outside the door)
 #define IR_INNER_PIN    GPIO_NUM_14   // inner receiver (inside the door)
+#define RELAY_PIN       GPIO_NUM_23   // relay IN1 — active LOW
 
 // ── Detection timing ──────────────────────────────
 #define POLL_PERIOD_MS      10
@@ -52,6 +53,13 @@
 static const char *TAG = "SmartHome";
 
 static void mqtt_pub(const char *topic, const char *data);
+
+static void relay_set(bool on)
+{
+    // Most relay modules are active LOW: LOW = relay energized = lamp ON
+    gpio_set_level(RELAY_PIN, on ? 1 : 0);
+    ESP_LOGI("relay", "Lamp %s", on ? "ON" : "OFF");
+}
 
 // ── WiFi ──────────────────────────────────────────
 static EventGroupHandle_t wifi_event_group;
@@ -216,6 +224,7 @@ static void detection_poll(void)
                 if (people_count == 0 && room_occupied) {
                     room_occupied = false;
                     mqtt_pub(TOPIC_ROOM, "EMPTY");
+                    relay_set(false);
                 }
                 ESP_LOGI(TAG, "<<< EXIT (people in room: %d)", people_count);
                 last_detection_at = now;
@@ -236,6 +245,7 @@ static void detection_poll(void)
                 if (!room_occupied) {
                     room_occupied = true;
                     mqtt_pub(TOPIC_ROOM, "OCCUPIED");
+                    relay_set(true);
                 }
                 ESP_LOGI(TAG, ">>> ENTRANCE confirmed (people in room: %d)", people_count);
                 last_detection_at = now;
@@ -462,9 +472,9 @@ static void on_command(const char *cmd)
 {
     ESP_LOGI(TAG, "Command received: %s", cmd);
     if (strcmp(cmd, "LIGHTS_ON") == 0) {
-        ESP_LOGI(TAG, ">>> Lights ON");
+        relay_set(true);
     } else if (strcmp(cmd, "LIGHTS_OFF") == 0) {
-        ESP_LOGI(TAG, ">>> Lights OFF");
+        relay_set(false);
     } else if (strcmp(cmd, "STATUS") == 0) {
         mqtt_pub(TOPIC_ROOM, room_occupied ? "OCCUPIED" : "EMPTY");
     }
@@ -550,6 +560,19 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     mqtt_tx_mutex = xSemaphoreCreateMutex();
+
+    // Relay — start with lamp OFF (HIGH = relay off for active-LOW module)
+    gpio_config_t relay_cfg = {
+        .pin_bit_mask = (1ULL << RELAY_PIN),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&relay_cfg);
+    relay_set(true);
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    relay_set(false);
 
     // PIR
     gpio_config_t pir_cfg = {
