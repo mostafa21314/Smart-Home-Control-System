@@ -17,18 +17,14 @@
 #include "driver/gpio.h"
 #include "esp_rom_sys.h"
 #include "soc/gpio_reg.h"
-
+#include "secrets.h"
 // ── WiFi credentials ──────────────────────────────────────────────────────────
-#define WIFI_SSID       "Redmi"
-#define WIFI_PASS       "12345678ok"
 #define WIFI_MAX_RETRY  10
 
 // ── Firebase configuration ────────────────────────────────────────────────────
 // Replace these with your actual Firebase project values.
 // FIREBASE_HOST    : your Realtime Database URL (no trailing slash, no https://)
 // FIREBASE_API_KEY : your Web API key (used for anonymous sign-in via Identity Toolkit)
-#define FIREBASE_HOST     "embeddedpro-573f6-default-rtdb.firebaseio.com"
-#define FIREBASE_API_KEY  "AIzaSyDDr6BjgGft1NnRrvOHGqe84ZWzmY_LiRI"
 #define FIREBASE_BASE     "/smarthome/room001"
 
 // ── Firebase anonymous-auth token state ──────────────────────────────────────

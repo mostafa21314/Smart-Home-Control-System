@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Home — Room 001</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d0f12;
+    --surface: #161921;
+    --surface2: #1e2230;
+    --border: rgba(255,255,255,0.07);
+    --border2: rgba(255,255,255,0.13);
+    --text: #e8ecf4;
+    --muted: #6b7280;
+    --accent: #3b82f6;
+    --accent2: #1d4ed8;
+    --green: #10b981;
+    --green-dim: rgba(16,185,129,0.12);
+    --amber: #f59e0b;
+    --amber-dim: rgba(245,158,11,0.12);
+    --red: #ef4444;
+    --red-dim: rgba(239,68,68,0.12);
+    --blue-dim: rgba(59,130,246,0.12);
+    --radius: 12px;
+    --radius-sm: 8px;
+    --mono: 'JetBrains Mono', monospace;
+    --sans: 'Space Grotesk', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 0;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── Top bar ── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 18px 32px;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    background: rgba(13,15,18,0.92);
+    backdrop-filter: blur(12px);
+    z-index: 10;
+  }
+  .logo { font-size: 15px; font-weight: 600; letter-spacing: -0.3px; color: var(--text); }
+  .logo span { color: var(--muted); font-weight: 400; }
+  .status-pill {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 500;
+    padding: 5px 12px;
+    border-radius: 99px;
+    border: 1px solid var(--border2);
+    background: var(--surface2);
+    color: var(--muted);
+    transition: all 0.4s;
+  }
+  .status-pill.live { color: var(--green); border-color: rgba(16,185,129,0.3); background: var(--green-dim); }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .dot.pulse { animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+  /* ── Layout ── */
+  main { padding: 28px 32px; max-width: 1100px; margin: 0 auto; }
+
+  .section-label {
+    font-size: 11px; font-weight: 500; letter-spacing: 1.2px;
+    text-transform: uppercase; color: var(--muted);
+    margin-bottom: 14px;
+  }
+
+  /* ── Config card ── */
+  .config-card {
+    background: var(--surface);
+    border: 1px solid var(--border2);
+    border-radius: var(--radius);
+    padding: 22px 24px;
+    margin-bottom: 28px;
+  }
+  .config-card h2 { font-size: 14px; font-weight: 600; margin-bottom: 16px; }
+  .config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .field label {
+    display: block; font-size: 11px; font-weight: 500;
+    color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px;
+    margin-bottom: 6px;
+  }
+  .field input {
+    width: 100%; background: var(--bg); border: 1px solid var(--border2);
+    border-radius: var(--radius-sm); padding: 9px 12px;
+    font-family: var(--mono); font-size: 13px; color: var(--text);
+    outline: none; transition: border-color 0.2s;
+  }
+  .field input:focus { border-color: var(--accent); }
+  .field.full { grid-column: 1 / -1; }
+  .btn-connect {
+    margin-top: 16px; padding: 10px 24px;
+    background: var(--accent); border: none; border-radius: var(--radius-sm);
+    font-family: var(--sans); font-size: 13px; font-weight: 600;
+    color: #fff; cursor: pointer; transition: background 0.2s;
+  }
+  .btn-connect:hover { background: var(--accent2); }
+  .btn-connect:disabled { background: var(--surface2); color: var(--muted); cursor: not-allowed; }
+
+  /* ── Metrics grid ── */
+  .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 28px; }
+  .metric-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 20px;
+    position: relative; overflow: hidden;
+    transition: border-color 0.3s;
+  }
+  .metric-card:hover { border-color: var(--border2); }
+  .metric-card .m-label {
+    font-size: 11px; font-weight: 500; text-transform: uppercase;
+    letter-spacing: 0.9px; color: var(--muted); margin-bottom: 10px;
+  }
+  .metric-card .m-value {
+    font-family: var(--mono); font-size: 28px; font-weight: 500;
+    line-height: 1; letter-spacing: -1px;
+    transition: color 0.3s;
+  }
+  .metric-card .m-unit {
+    font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 3px;
+  }
+  .metric-card .m-icon {
+    position: absolute; right: 16px; top: 16px;
+    font-size: 18px; color: var(--muted); opacity: 0.5;
+  }
+  .metric-card.green .m-value { color: var(--green); }
+  .metric-card.amber .m-value { color: var(--amber); }
+  .metric-card.blue  .m-value { color: var(--accent); }
+
+  /* ── Room status banner ── */
+  .room-banner {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 24px; border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: var(--surface);
+    margin-bottom: 28px;
+    transition: all 0.5s;
+  }
+  .room-banner.occupied {
+    border-color: rgba(16,185,129,0.3);
+    background: linear-gradient(90deg, var(--surface) 60%, var(--green-dim));
+  }
+  .room-banner.empty {
+    border-color: rgba(107,114,128,0.3);
+  }
+  .room-status-text { font-size: 18px; font-weight: 600; }
+  .room-status-text .badge {
+    display: inline-block; font-size: 11px; font-weight: 500;
+    padding: 3px 10px; border-radius: 99px; margin-left: 10px;
+    vertical-align: middle;
+  }
+  .badge.occ { background: var(--green-dim); color: var(--green); border: 1px solid rgba(16,185,129,0.3); }
+  .badge.emp { background: var(--surface2); color: var(--muted); border: 1px solid var(--border2); }
+  .room-count {
+    font-family: var(--mono); font-size: 38px; font-weight: 500;
+    color: var(--text); letter-spacing: -2px;
+  }
+  .room-count span { font-size: 14px; color: var(--muted); font-family: var(--sans); letter-spacing: 0; }
+
+  /* ── Controls ── */
+  .controls-row {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+    margin-bottom: 28px;
+  }
+  .control-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px 22px;
+  }
+  .control-card h3 { font-size: 13px; font-weight: 600; margin-bottom: 16px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; }
+  .relay-toggle {
+    display: flex; align-items: center; gap: 14px;
+  }
+  .toggle-switch {
+    position: relative; width: 52px; height: 28px; cursor: pointer;
+  }
+  .toggle-switch input { opacity: 0; width: 0; height: 0; }
+  .toggle-track {
+    position: absolute; inset: 0;
+    background: var(--surface2); border: 1px solid var(--border2);
+    border-radius: 99px; transition: all 0.25s;
+  }
+  .toggle-thumb {
+    position: absolute; width: 20px; height: 20px;
+    background: var(--muted); border-radius: 50%;
+    top: 3px; left: 3px; transition: all 0.25s;
+  }
+  input:checked ~ .toggle-track { background: var(--green-dim); border-color: rgba(16,185,129,0.4); }
+  input:checked ~ .toggle-thumb { left: 27px; background: var(--green); }
+  .relay-label { font-size: 14px; font-weight: 500; }
+
+  .cmd-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .cmd-btn {
+    padding: 8px 16px; border-radius: var(--radius-sm);
+    font-family: var(--sans); font-size: 12px; font-weight: 600;
+    border: 1px solid var(--border2); background: var(--surface2);
+    color: var(--text); cursor: pointer; transition: all 0.15s;
+    letter-spacing: 0.3px;
+  }
+  .cmd-btn:hover { background: var(--surface); border-color: var(--accent); color: var(--accent); }
+  .cmd-btn:active { transform: scale(0.97); }
+  .cmd-btn.primary { background: var(--blue-dim); border-color: rgba(59,130,246,0.3); color: var(--accent); }
+
+  /* ── Log ── */
+  .log-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px 22px;
+  }
+  .log-card h3 { font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.9px; color: var(--muted); margin-bottom: 14px; }
+  .log-list { list-style: none; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
+  .log-item {
+    display: flex; align-items: center; gap: 10px;
+    font-family: var(--mono); font-size: 12px; padding: 6px 0;
+    border-bottom: 1px solid var(--border); color: var(--muted);
+  }
+  .log-item:last-child { border: none; }
+  .log-item .log-time { color: var(--muted); min-width: 68px; }
+  .log-item .log-msg { color: var(--text); }
+  .log-item .log-tag {
+    font-size: 10px; padding: 2px 7px; border-radius: 4px;
+    font-family: var(--sans); font-weight: 500;
+  }
+  .log-item .log-tag.enter { background: var(--green-dim); color: var(--green); }
+  .log-item .log-tag.exit { background: var(--amber-dim); color: var(--amber); }
+  .log-item .log-tag.cmd { background: var(--blue-dim); color: var(--accent); }
+  .log-item .log-tag.temp { background: var(--surface2); color: var(--muted); }
+
+  /* ── Error toast ── */
+  .toast {
+    position: fixed; bottom: 24px; right: 24px;
+    background: var(--red-dim); border: 1px solid rgba(239,68,68,0.3);
+    color: var(--red); padding: 12px 18px; border-radius: var(--radius-sm);
+    font-size: 13px; display: none; max-width: 300px;
+  }
+  .toast.show { display: block; }
+
+  @media (max-width: 700px) {
+    main { padding: 16px; }
+    .metrics { grid-template-columns: 1fr 1fr; }
+    .controls-row { grid-template-columns: 1fr; }
+    .config-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">smart<span>home</span> · room 001</div>
+  <div class="status-pill" id="connBadge">
+    <span class="dot" id="connDot"></span>
+    <span id="connLabel">Disconnected</span>
+  </div>
+</header>
+
+<main>
+
+  <!-- Config -->
+  <p class="section-label">Firebase configuration</p>
+  <div class="config-card">
+    <div class="config-grid">
+      <div class="field full">
+        <label>Realtime Database URL</label>
+        <input type="text" id="fbHost" placeholder="your-project-default-rtdb.firebaseio.com"
+               value="embeddedpro-573f6-default-rtdb.firebaseio.com" />
+      </div>
+      <div class="field full">
+        <label>Web API Key (for anonymous sign-in)</label>
+        <input type="text" id="fbApiKey" value="AIzaSyDDr6BjgGft1NnRrvOHGqe84ZWzmY_LiRI" />
+      </div>
+      <div class="field full">
+        <label>ID token (auto-filled on connect)</label>
+        <input type="password" id="fbAuth" placeholder="auto-filled after anonymous sign-in" />
+      </div>
+      <div class="field">
+        <label>Base path</label>
+        <input type="text" id="fbPath" value="/smarthome/room001" />
+      </div>
+      <div class="field">
+        <label>Poll interval (ms)</label>
+        <input type="number" id="fbPoll" value="3000" min="1000" />
+      </div>
+    </div>
+    <button class="btn-connect" id="btnConnect" onclick="startPolling()">Connect</button>
+  </div>
+
+  <!-- Room banner -->
+  <div class="room-banner empty" id="roomBanner">
+    <div>
+      <div class="m-label" style="margin-bottom:6px">Room status</div>
+      <div class="room-status-text">
+        <span id="roomText">Unknown</span>
+        <span class="badge emp" id="roomBadge">—</span>
+      </div>
+    </div>
+    <div style="text-align:right">
+      <div class="m-label" style="margin-bottom:4px">People in room</div>
+      <div class="room-count" id="countDisplay">—<span> people</span></div>
+    </div>
+  </div>
+
+  <!-- Metrics -->
+  <p class="section-label">Environment</p>
+  <div class="metrics" style="margin-bottom: 28px;">
+    <div class="metric-card amber">
+      <div class="m-label">Temperature</div>
+      <div class="m-value" id="tempVal">—<span class="m-unit">°C</span></div>
+    </div>
+    <div class="metric-card blue">
+      <div class="m-label">Humidity</div>
+      <div class="m-value" id="humVal">—<span class="m-unit">%</span></div>
+    </div>
+    <div class="metric-card green">
+      <div class="m-label">Last seen</div>
+      <div class="m-value" id="lastSeen" style="font-size:16px; padding-top:6px; font-family: var(--sans);">—</div>
+    </div>
+    <div class="metric-card">
+      <div class="m-label">Updates</div>
+      <div class="m-value" id="updateCount" style="color: var(--text);">0</div>
+    </div>
+  </div>
+
+  <!-- Controls -->
+  <p class="section-label">Controls</p>
+  <div class="controls-row">
+    <div class="control-card">
+      <h3>Lamp relay</h3>
+      <div class="relay-toggle">
+        <label class="toggle-switch">
+          <input type="checkbox" id="relayToggle" onchange="sendCommand(this.checked ? 'LIGHTS_ON' : 'LIGHTS_OFF')">
+          <div class="toggle-track"></div>
+          <div class="toggle-thumb"></div>
+        </label>
+        <span class="relay-label" id="relayLabel">Off</span>
+      </div>
+    </div>
+    <div class="control-card">
+      <h3>Commands</h3>
+      <div class="cmd-btns">
+        <button class="cmd-btn primary" onclick="sendCommand('STATUS')">Refresh status</button>
+        <button class="cmd-btn" onclick="sendCommand('LIGHTS_ON')">Lights on</button>
+        <button class="cmd-btn" onclick="sendCommand('LIGHTS_OFF')">Lights off</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div class="log-card">
+    <h3>Event log</h3>
+    <ul class="log-list" id="logList">
+      <li class="log-item">
+        <span class="log-time">—</span>
+        <span class="log-msg">Waiting for connection…</span>
+      </li>
+    </ul>
+  </div>
+
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let pollTimer = null;
+let updateCount = 0;
+let relayState = false;
+let idTokenExpiry = 0;
+
+async function signInAnonymous() {
+  const apiKey = document.getElementById('fbApiKey').value.trim();
+  if (!apiKey) { showToast('Enter your Web API Key.'); return false; }
+  try {
+    const r = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${apiKey}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ returnSecureToken: true }) }
+    );
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error?.message || `HTTP ${r.status}`);
+    document.getElementById('fbAuth').value = data.idToken;
+    idTokenExpiry = Date.now() + (parseInt(data.expiresIn) - 120) * 1000;
+    addLog('cmd', 'Anonymous sign-in OK');
+    return true;
+  } catch(e) {
+    showToast('Sign-in failed: ' + e.message);
+    return false;
+  }
+}
+
+async function ensureToken() {
+  const auth = document.getElementById('fbAuth').value.trim();
+  if (auth && Date.now() < idTokenExpiry) return true;
+  return await signInAnonymous();
+}
+
+function fbUrl(path) {
+  const host = document.getElementById('fbHost').value.trim();
+  const auth = document.getElementById('fbAuth').value.trim();
+  const base = document.getElementById('fbPath').value.trim();
+  const query = auth ? `?auth=${auth}` : '';
+  return `https://${host}${base}${path}${query}`;
+}
+
+async function fbGet(path) {
+  const r = await fetch(fbUrl(path));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+async function fbPut(path, value) {
+  const r = await fetch(fbUrl(path), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(value)
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+}
+
+async function fbDelete(path) {
+  await fetch(fbUrl(path), { method: 'DELETE' });
+}
+
+async function startPolling() {
+  const host = document.getElementById('fbHost').value.trim();
+  if (!host) { showToast('Enter your Firebase Realtime Database host.'); return; }
+
+  const ok = await ensureToken();
+  if (!ok) return;
+
+  if (pollTimer) clearInterval(pollTimer);
+
+  const interval = parseInt(document.getElementById('fbPoll').value) || 3000;
+  document.getElementById('btnConnect').disabled = true;
+  document.getElementById('btnConnect').textContent = 'Connected';
+
+  poll();
+  pollTimer = setInterval(poll, interval);
+}
+
+async function poll() {
+  try {
+    await ensureToken();
+    const data = await fbGet('.json');
+    setConnected(true);
+    applyData(data);
+  } catch(e) {
+    setConnected(false);
+    showToast('Firebase error: ' + e.message);
+  }
+}
+
+function applyData(data) {
+  if (!data) return;
+  updateCount++;
+  document.getElementById('updateCount').textContent = updateCount;
+
+  const now = new Date();
+  document.getElementById('lastSeen').textContent =
+    now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+  if (data.temperature != null) {
+    document.getElementById('tempVal').innerHTML =
+      `${parseFloat(data.temperature).toFixed(1)}<span class="m-unit">°C</span>`;
+  }
+  if (data.humidity != null) {
+    document.getElementById('humVal').innerHTML =
+      `${parseFloat(data.humidity).toFixed(1)}<span class="m-unit">%</span>`;
+    addLog('temp', `Temp ${parseFloat(data.temperature).toFixed(1)}°C · Hum ${parseFloat(data.humidity).toFixed(1)}%`);
+  }
+
+  const count = data.count != null ? parseInt(data.count) : null;
+  if (count != null) {
+    document.getElementById('countDisplay').innerHTML = `${count}<span> people</span>`;
+  }
+
+  const room = data.room;
+  const banner = document.getElementById('roomBanner');
+  const roomText = document.getElementById('roomText');
+  const roomBadge = document.getElementById('roomBadge');
+  if (room === 'OCCUPIED') {
+    banner.className = 'room-banner occupied';
+    roomText.textContent = 'Occupied';
+    roomBadge.className = 'badge occ';
+    roomBadge.textContent = 'occupied';
+    if (count != null) addLog('enter', `Room occupied · ${count} person(s)`);
+  } else if (room === 'EMPTY') {
+    banner.className = 'room-banner empty';
+    roomText.textContent = 'Empty';
+    roomBadge.className = 'badge emp';
+    roomBadge.textContent = 'empty';
+  }
+}
+
+async function sendCommand(cmd) {
+  try {
+    await fbPut('/command.json', cmd);
+    addLog('cmd', `Command sent: ${cmd}`);
+    if (cmd === 'LIGHTS_ON') setRelay(true);
+    if (cmd === 'LIGHTS_OFF') setRelay(false);
+  } catch(e) {
+    showToast('Failed to send command: ' + e.message);
+  }
+}
+
+function setRelay(on) {
+  relayState = on;
+  document.getElementById('relayToggle').checked = on;
+  document.getElementById('relayLabel').textContent = on ? 'On' : 'Off';
+}
+
+function setConnected(ok) {
+  const badge = document.getElementById('connBadge');
+  const dot = document.getElementById('connDot');
+  const label = document.getElementById('connLabel');
+  if (ok) {
+    badge.className = 'status-pill live';
+    dot.className = 'dot pulse';
+    label.textContent = 'Live';
+  } else {
+    badge.className = 'status-pill';
+    dot.className = 'dot';
+    label.textContent = 'Disconnected';
+  }
+}
+
+function addLog(tag, msg) {
+  const list = document.getElementById('logList');
+  const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const li = document.createElement('li');
+  li.className = 'log-item';
+  li.innerHTML = `<span class="log-time">${time}</span>
+    <span class="log-tag ${tag}">${tag}</span>
+    <span class="log-msg">${msg}</span>`;
+  if (list.children.length === 1 && list.children[0].querySelector('.log-msg')?.textContent.includes('Waiting')) {
+    list.innerHTML = '';
+  }
+  list.insertBefore(li, list.firstChild);
+  if (list.children.length > 50) list.removeChild(list.lastChild);
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show';
+  setTimeout(() => t.className = 'toast', 4000);
+}
+</script>
+</body>
+</html>
